@@ -1,141 +1,142 @@
 import pandas as pd
 from pathlib import Path
-from configparser import ConfigParser
-from typing import Literal
 
-def load_ini(path: str | Path) -> ConfigParser:
-    cfg = ConfigParser()
-    with open(path, "r", encoding="utf-8") as f:
-        cfg.read_file(f)
-    return cfg
+# ----------------------------
+# Utilidades
+# ----------------------------
+def _to_int64_nullable(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    # redondeo por seguridad si viniera con decimales
+    return s.round(0).astype("Int64")
 
-def parse_inline_refs(raw: str) -> list[str]:
-    items = []
-    for chunk in raw.replace("\n", ",").split(","):
-        s = chunk.strip()
-        if s:
-            items.append(s)
-    return items
+def _clean_ref_col(series: pd.Series) -> pd.Series:
+    return (series.astype("string")
+                  .str.strip()
+                  .str.replace(r"[\x00-\x1F\x7F]", "", regex=True))
 
-def load_selection_from_cfg(cfg: ConfigParser) -> tuple[str, list[str]]:
-    mode = cfg.get("seleccion", "mode", fallback="auto").strip().lower()
-    source = cfg.get("seleccion", "source", fallback="inline").strip().lower()
-
-    refs: list[str] = []
-    if source == "inline":
-        raw = cfg.get("seleccion", "refs_inline", fallback="")
-        refs = parse_inline_refs(raw)
-    elif source == "file":
-        file_path = cfg.get("seleccion", "refs_file", fallback="")
-        if file_path:
-            p = Path(file_path)
-            if p.is_file():
-                txt = p.read_text(encoding="utf-8")
-                refs = parse_inline_refs(txt)
-
-    # Sanitizar
-    refs = [r.strip() for r in refs if r and r.strip()]
-
-    # Fallback: si no hay refs, no filtrar (usar all)
-    if mode in ("subset", "auto") and len(refs) == 0:
-        mode = "all"
-    return mode, refs
-
-def _clean_ref(series: pd.Series) -> pd.Series:
-    return (
-        series.astype("string")
-        .str.strip()
-        .str.replace(r"[\x00-\x1F\x7F]", "", regex=True)
-    )
-
-def procesar_ventas(
-    ventas_path: str | Path,
-    ventas_sheet: str = "Sheet1",
-    seleccion_mode: Literal["all", "subset", "auto"] = "auto",
-    seleccion_refs: list[str] | None = None,
+# ----------------------------
+# Pipeline principal
+# ----------------------------
+def procesar_stock(
+    stock_path: str | Path,
+    stock_sheet: str = "Sheet1",
+    venta_df: pd.DataFrame | None = None,          # Debe tener columna 'Referencia'
+    venta_path: str | None = None,
+    venta_sheet: str | None = None,
+    seleccion_df: pd.DataFrame | None = None,      # Debe tener columna 'Referencias'
+    seleccion_path: str | None = None,
+    seleccion_sheet: str | None = None,
 ) -> pd.DataFrame:
-    df = pd.read_excel(ventas_path, sheet_name=ventas_sheet, engine="openpyxl")
+    """
+    Replica en pandas el código M proporcionado para Stock.xlsx.
+    """
+    # 1) Cargar
+    df = pd.read_excel(stock_path, sheet_name=stock_sheet, engine="openpyxl")
 
-    # === Pipeline base (equivalente a Power Query anterior) ===
-    df = df[df["CLASIFICACION"] == "6301 - PRENDAS"].copy()
+    # 2) Referencia no empieza por "N"
     df = df[~df["Referencia"].astype(str).str.startswith("N")].copy()
 
-    money_cols = ["Precio unit.", "Valor bruto", "Valor descuentos", "Valor subtotal", "Valor neto"]
-    for c in money_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    # 3) Asegurar texto en Referencia
+    df["Referencia"] = df["Referencia"].astype("string")
 
-    df = df.drop(
-        columns=[c for c in ["Razón social cliente factura", "Costo promedio total", "Estado"] if c in df.columns],
-        errors="ignore",
-    )
+    # 4) SKU = Referencia & Desc. detalle ext. 2  (y renombrar a 'SKU')
+    df["SKU"] = (df["Referencia"].fillna("") + df["Desc. detalle ext. 2"].fillna("")).astype("string")
 
-    df["SKU"] = (
-        df["Referencia"].fillna("").astype(str) + df["Desc. detalle ext. 2"].fillna("").astype(str)
-    )
+    # 5) Quitar columna 'Existencia' original (si existe)
+    df = df.drop(columns=[c for c in ["Existencia"] if c in df.columns], errors="ignore")
 
-    if "Desc. C.O." in df.columns:
-        df["Desc. C.O."] = df["Desc. C.O."].astype("string").str.replace("PRINCIPAL", "ECOMMERCE", regex=False)
+    # 6) Nueva 'Existencia' = Cant. disponible + Cant. transito ent.
+    #    (primero hacemos numérico y llenamos nulos con 0)
+    disp = pd.to_numeric(df.get("Cant. disponible", pd.NA), errors="coerce").fillna(0)
+    trans = pd.to_numeric(df.get("Cant. transito ent.", pd.NA), errors="coerce").fillna(0)
+    df["Existencia"] = disp + trans
 
-    df = df.drop(
-        columns=[c for c in ["Nro documento", "Precio unit.", "Valor bruto", "Valor descuentos",
-                             "Valor subtotal", "CLASIFICACION", "SUBLINEA"] if c in df.columns],
-        errors="ignore",
-    )
+    # 7) Eliminar columnas source de la suma
+    df = df.drop(columns=[c for c in ["Cant. disponible", "Cant. transito ent."] if c in df.columns], errors="ignore")
 
+    # 8) Renombrar 'Desc. detalle ext. 2' -> 'Talla'
     if "Desc. detalle ext. 2" in df.columns:
         df = df.rename(columns={"Desc. detalle ext. 2": "Talla"})
 
-    df = df.drop(columns=[c for c in ["GENERO", "CAPSULA"] if c in df.columns], errors="ignore")
+    # 9) Quitar 'CLASIFICACION' si existe
+    df = df.drop(columns=[c for c in ["CLASIFICACION"] if c in df.columns], errors="ignore")
 
-    df = df[~df["Referencia"].fillna("").astype(str).str.contains("PROMO", na=False)].copy()
+    # 10) Filtro por Desc. bodega (lista blanca)
+    bodegas_ok = {
+        "BARRANQUILLA BUENAVISTA", "BARRANQUILLA PORTAL DEL PRADO", "BARRANQUILLA UNICO",
+        "BARRANQUILLA VIVA", "BODEGA ECOMMERCE", "BODEGA PRINCIPAL", "BOGOTA PLAZA CENTRAL",
+        "BUGA PLAZA", "CALI CHIPICHAPE", "CALI JARDIN PLAZA", "CALI UNICENTRO", "CALI UNICO",
+        "CARTAGENA CARIBE PLAZA", "CUCUTA UNICENTRO", "ECOMMERCE", "MONTERIA ALAMEDAS",
+        "NEIVA SAN PEDRO", "PALMIRA LLANOGRANDE", "POPAYAN CAMPANARIO", "SABANETA MAYORCA",
+        "TULUA LA HERRADURA"
+    }
+    if "Desc. bodega" in df.columns:
+        df = df[df["Desc. bodega"].isin(bodegas_ok)].copy()
 
-    df["Referencia"] = _clean_ref(df["Referencia"])
+    # 11) Asegurar SKU como texto
+    df["SKU"] = df["SKU"].astype("string")
 
-    if "Fecha" in df.columns:
-        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.date
+    # 12) Filtrar: Referencia no contiene "PROMO"
+    df = df[~df["Referencia"].fillna("").str.contains("PROMO", na=False)].copy()
 
-    if "Valor neto" in df.columns:
-        df["Valor neto"] = pd.to_numeric(df["Valor neto"], errors="coerce").round(0).astype("Int64")
+    # 13) Filtrar: Referencia no empieza por "S"
+    df = df[~df["Referencia"].astype(str).str.startswith("S")].copy()
 
-    # Reorden útil (si existen)
-    desired = ["C.O.", "Bodega", "Desc. C.O.", "Fecha", "Referencia", "Desc. item", "Talla",
-               "Cantidad inv.", "Valor neto", "RANGO", "SKU"]
+    # 14) Trim + Clean en Referencia
+    df["Referencia"] = _clean_ref_col(df["Referencia"])
+
+    # 15) Join interno con Venta (por Referencia)
+    if venta_df is None:
+        if not (venta_path and venta_sheet):
+            raise ValueError("Proporciona venta_df o (venta_path y venta_sheet).")
+        venta_df = pd.read_excel(venta_path, sheet_name=venta_sheet, engine="openpyxl")
+    if "Referencia" not in venta_df.columns:
+        raise KeyError("La tabla 'Venta' debe contener la columna 'Referencia'.")
+    refs_venta = _clean_ref_col(venta_df["Referencia"])
+    df = df[df["Referencia"].isin(refs_venta)].copy()
+
+    # 16) Convertir 'Existencia' a entero nullable (Int64)
+    df["Existencia"] = _to_int64_nullable(df["Existencia"])
+
+    # 17) Join interno con Seleccion (Referencia ∈ Seleccion.Referencias)
+    if seleccion_df is None:
+        if not (seleccion_path and seleccion_sheet):
+            raise ValueError("Proporciona seleccion_df o (seleccion_path y seleccion_sheet).")
+        seleccion_df = pd.read_excel(seleccion_path, sheet_name=seleccion_sheet, engine="openpyxl")
+    if "Referencias" not in seleccion_df.columns:
+        raise KeyError("La tabla 'Seleccion' debe contener la columna 'Referencias'.")
+    refs_sel = _clean_ref_col(seleccion_df["Referencias"])
+    df = df[df["Referencia"].isin(refs_sel)].copy()
+
+    # Reorden opcional (para dejar lo relevante al frente si existe)
+    desired = ["Referencia", "SKU", "Talla", "Existencia", "Desc. bodega"]
     front = [c for c in desired if c in df.columns]
-    df = df[front + [c for c in df.columns if c not in front]]
-
-    # === Selección al final (clave para no duplicar en Stock) ===
-    if seleccion_mode == "subset" and seleccion_refs:
-        refs = _clean_ref(pd.Series(seleccion_refs))
-        df = df[df["Referencia"].isin(refs)].copy()
-    # 'auto' ya se resolvió a 'all' si no había refs; 'all' significa no filtrar
+    rest  = [c for c in df.columns if c not in front]
+    df = df[front + rest]
 
     return df
 
-def main(config_path: str | Path = "config.ini"):
-    cfg = load_ini(config_path)
+# ----------------------------
+# Ejemplo de uso
+# ----------------------------
+if __name__ == "__main__":
+    # Rutas de ejemplo
+    stock_path = r"C:\Users\ACER\Desktop\Stock.xlsx"
 
-    ventas_path = cfg.get("paths", "ventas", fallback="Ventas.xlsx")
-    out_dir = Path(cfg.get("paths", "out_dir", fallback=".")).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Opción A: pasar dataframes ya cargados
+    # venta_df = pd.read_excel(r"C:\ruta\Venta.xlsx", sheet_name="Venta", engine="openpyxl")
+    # seleccion_df = pd.read_excel(r"C:\ruta\Seleccion.xlsx", sheet_name="Seleccion", engine="openpyxl")
 
-    # Salida de ventas
-    ventas_out_cfg = cfg.get("paths", "ventas_out", fallback="ventas_procesadas.xlsx")
-    ventas_out = Path(ventas_out_cfg)
-    if not ventas_out.is_absolute():
-        ventas_out = out_dir / ventas_out
-
-    sel_mode, sel_refs = load_selection_from_cfg(cfg)
-
-    df = procesar_ventas(
-        ventas_path=ventas_path,
-        ventas_sheet="Sheet1",
-        seleccion_mode=sel_mode,
-        seleccion_refs=sel_refs,
+    # Opción B: cargar desde archivos (descomenta y ajusta)
+    df_final = procesar_stock(
+        stock_path=stock_path,
+        stock_sheet="Sheet1",
+        venta_path=r"C:\ruta\Venta.xlsx", venta_sheet="Venta",
+        seleccion_path=r"C:\ruta\Seleccion.xlsx", seleccion_sheet="Seleccion"
+        # Si usas la Opción A, pasa venta_df=..., seleccion_df=... y omite los paths.
     )
 
-    df.to_excel(ventas_out, index=False)
-    print(f"Ventas procesadas -> {ventas_out}")
-
-if __name__ == "__main__":
-    main()
+    # Guardar XLSX
+    out_path = Path(stock_path).with_name("Stock_procesado.xlsx")
+    df_final.to_excel(out_path, index=False)
+    print(f"OK -> {out_path}")
