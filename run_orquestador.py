@@ -17,7 +17,15 @@ from pathlib import Path
 import pandas as pd
 
 # --- asegurar imports locales (misma carpeta) ---
-BASE = Path(__file__).parent.resolve()
+"""BASE = Path(__file__).parent.resolve()
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))"""
+
+if getattr(sys, "frozen", False):  # ejecutable (PyInstaller)
+    BASE = Path(sys.executable).parent.resolve()
+else:                              # script normal
+    BASE = Path(__file__).parent.resolve()
+
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
@@ -151,6 +159,7 @@ def main():
         ventas_path=ventas_xlsx,
         ventas_sheet=args.ventas_sheet,
         seleccion_df=seleccion_df,  # None = no filtro
+        debug=args.debug,
     )
     exportar_xlsx(df_ventas, ventas_out, add_resumen=True)
 

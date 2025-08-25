@@ -1,9 +1,28 @@
 import pandas as pd
 from pathlib import Path
-
+import re, unicodedata  # <-- nuevo
 # ----------------------------
 # Utilidades
 # ----------------------------
+
+
+def _norm_txt(s: str) -> str:
+    """minúsculas, sin acentos, sin símbolos (solo a-z0-9)."""
+    s = str(s).strip().lower()
+    s = ''.join(ch for ch in unicodedata.normalize('NFD', s)
+                if unicodedata.category(ch) != 'Mn')
+    return re.sub(r'[^a-z0-9]+', '', s)
+
+def find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """Devuelve el nombre REAL de la primera columna cuyo nombre 'normalizado'
+    coincide con alguno de candidates (tolerante a acentos/espacios)."""
+    norm_map = {_norm_txt(c): c for c in df.columns.astype(str)}
+    for cand in candidates:
+        key = _norm_txt(cand)
+        if key in norm_map:
+            return norm_map[key]
+    return None
+
 def to_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     """Convierte a número (float) de forma segura las columnas indicadas."""
     for c in cols:
@@ -26,22 +45,52 @@ def build_sku(df: pd.DataFrame,
                    + df.get(talla_src, "").fillna("").astype(str))
     return df
 
-def filtrar_por_seleccion(df: pd.DataFrame,
-                          seleccion_df: pd.DataFrame | None = None,
-                          seleccion_path: str | None = None,
-                          seleccion_sheet: str | None = None) -> pd.DataFrame:
-    """Aplica inner-filter por Referencia ∈ Seleccion.Referencias."""
+def filtrar_por_seleccion(
+    df: pd.DataFrame,
+    seleccion_df: pd.DataFrame | None = None,
+    seleccion_path: str | None = None,
+    seleccion_sheet: str | None = None,
+    debug: bool = False,
+) -> pd.DataFrame:
+    """
+    Si hay selección (DataFrame o archivo), filtra por Referencia ∈ Seleccion.Referencias.
+    Si NO hay selección, NO filtra y devuelve df intacto (comportamiento seguro).
+    """
+    # Caso 1: no se proporcionó selección -> no filtrar
+    if seleccion_df is None and not (seleccion_path and seleccion_sheet):
+        if debug:
+            print("[VENTAS] Sin selección: no se filtra por referencias.")
+        return df
+
+    # Caso 2: cargar desde archivo si no vino DataFrame
     if seleccion_df is None:
-        if not (seleccion_path and seleccion_sheet):
-            raise ValueError("Proporciona seleccion_df o (seleccion_path y seleccion_sheet).")
-        seleccion_df = pd.read_excel(seleccion_path, sheet_name=seleccion_sheet, engine="openpyxl")
+        try:
+            import pandas as pd
+            seleccion_df = pd.read_excel(seleccion_path, sheet_name=seleccion_sheet, engine="openpyxl")
+        except Exception as e:
+            if debug:
+                print(f"[VENTAS] No se pudo leer selección ({e}); no se filtra.")
+            return df
 
+    # Caso 3: validar columna
     if "Referencias" not in seleccion_df.columns:
-        raise KeyError("La tabla de selección debe contener la columna 'Referencias'.")
+        if debug:
+            print("[VENTAS] Selección sin columna 'Referencias'; no se filtra.")
+        return df
 
+    # Normalizar y filtrar
     refs = (seleccion_df["Referencias"].astype("string")
             .str.strip().str.replace(r"[\x00-\x1F\x7F]", "", regex=True))
-    return df[df["Referencia"].isin(refs)].copy()
+    refs = refs[refs.notna() & (refs != "")]
+    if len(refs) == 0:
+        if debug:
+            print("[VENTAS] Selección vacía; no se filtra.")
+        return df
+
+    out = df[df["Referencia"].astype(str).isin(refs.astype(str).unique())].copy()
+    if debug:
+        print(f"[VENTAS] Filtrado por selección: {len(out)}/{len(df)} filas.")
+    return out
 
 def exportar_xlsx(df: pd.DataFrame, out_path: str | Path,
                   add_resumen: bool = True,
@@ -81,12 +130,20 @@ def cargar_y_transformar(ventas_path: str | Path,
                          ventas_sheet: str = "Sheet1",
                          seleccion_df: pd.DataFrame | None = None,
                          seleccion_path: str | None = None,
-                         seleccion_sheet: str | None = None) -> pd.DataFrame:
+                         seleccion_sheet: str | None = None,
+                         debug: bool = False) -> pd.DataFrame:
     """Replica el flujo de Power Query, con fecha sin hora y Valor neto entero."""
     df = pd.read_excel(ventas_path, sheet_name=ventas_sheet, engine="openpyxl")
 
     # 1) Filtros iniciales
-    df = df[df["CLASIFICACION"] == "6301 - PRENDAS"].copy()
+    col_clas = find_col(df, ["CLASIFICACION", "Clasificación"])
+    if col_clas:
+        objetivo = _norm_txt("6301 - PRENDAS")
+        mask = df[col_clas].astype(str).map(_norm_txt).eq(objetivo)
+        df = df[mask].copy()
+    else:
+        print("[VENTAS] Aviso: no se encontró la columna CLASIFICACION/Clasificación; se omite ese filtro.")
+
     df = df[~df["Referencia"].astype(str).str.startswith("N")].copy()
 
     # 2) Normalizar numéricas (sin dividir entre 100)
@@ -137,7 +194,8 @@ def cargar_y_transformar(ventas_path: str | Path,
         df,
         seleccion_df=seleccion_df,
         seleccion_path=seleccion_path,
-        seleccion_sheet=seleccion_sheet
+        seleccion_sheet=seleccion_sheet,
+        debug=debug,
     )
 
     # 14) Reorden opcional (mantiene lo principal al frente si existe)
